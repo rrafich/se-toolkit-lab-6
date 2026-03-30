@@ -64,3 +64,5 @@ WORKDIR /app
 
 # Run the FastAPI application
 CMD ["sh", "-c", "python backend/app/run.py"]
+COPY src/qwen_code_api/ ./qwen_code_api/
+

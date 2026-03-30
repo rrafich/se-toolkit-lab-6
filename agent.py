@@ -19,7 +19,7 @@ from typing import Any
 
 
 def load_env() -> dict[str, str]:
-    """Load environment variables from .env.agent.secret."""
+    """Load environment variables from .env.agent.secret and .env.docker.secret."""
     env = {}
     env_file = ".env.agent.secret"
     
@@ -34,7 +34,24 @@ def load_env() -> dict[str, str]:
                 key, _, value = line.partition("=")
                 env[key.strip()] = value.strip().strip('"').strip("'")
     
-    for key in ["LLM_API_KEY", "LLM_API_BASE", "LLM_MODEL"]:
+    # Also load LMS_API_KEY from .env.docker.secret if not already set
+    if "LMS_API_KEY" not in env:
+        docker_env_file = ".env.docker.secret"
+        if os.path.exists(docker_env_file):
+            with open(docker_env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    if key.strip() == "LMS_API_KEY":
+                        env["LMS_API_KEY"] = value.strip().strip('"').strip("'")
+                        break
+    
+    # Environment variables override file values
+    for key in ["LLM_API_KEY", "LLM_API_BASE", "LLM_MODEL", "LMS_API_KEY", "AGENT_API_BASE_URL"]:
         if key in os.environ:
             env[key] = os.environ[key]
     
@@ -123,6 +140,81 @@ def list_files(path: str) -> dict[str, Any]:
         return {"success": False, "error": f"Error listing directory: {e}"}
 
 
+def query_api(method: str, path: str, body: str = None, api_key: str = None, api_base: str = None) -> dict[str, Any]:
+    """Call the backend API and return the response.
+    
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        path: API endpoint path (e.g., '/items/')
+        body: Optional JSON request body for POST/PUT requests
+        api_key: LMS API key for authentication
+        api_base: Base URL for the API
+        
+    Returns:
+        Dict with 'status_code' and 'body' or 'error'
+    """
+    if not api_base:
+        api_base = "http://localhost:42002"  # Default to caddy proxy
+    
+    # Ensure path starts with /
+    if not path.startswith("/"):
+        path = "/" + path
+    
+    url = f"{api_base}{path}"
+    
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    data = None
+    if body:
+        data = body.encode("utf-8")
+    
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            response_body = response.read().decode("utf-8")
+            status_code = response.status
+            
+            # Try to parse as JSON
+            try:
+                parsed_body = json.loads(response_body)
+            except json.JSONDecodeError:
+                parsed_body = response_body
+            
+            return {
+                "success": True,
+                "status_code": status_code,
+                "body": parsed_body
+            }
+    
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        try:
+            error_body = json.loads(error_body)
+        except json.JSONDecodeError:
+            pass
+        return {
+            "success": False,
+            "status_code": e.code,
+            "error": f"HTTP {e.code}: {error_body}"
+        }
+    except urllib.error.URLError as e:
+        return {
+            "success": False,
+            "error": f"Cannot reach API: {e.reason}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error querying API: {str(e)}"
+        }
+
+
 def get_tool_schemas() -> list[dict[str, Any]]:
     """Return tool schemas for OpenAI function calling."""
     return [
@@ -159,12 +251,40 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                     "required": ["path"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Call the backend API to fetch data or check system status. Use this for questions about current data, item counts, scores, or system information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method (GET, POST, PUT, DELETE)"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API endpoint path (e.g., '/items/', '/scores/')"
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON request body for POST/PUT requests"
+                        }
+                    },
+                    "required": ["method", "path"]
+                }
+            }
         }
     ]
 
 
-def execute_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+def execute_tool(tool_name: str, args: dict[str, Any], env: dict[str, str] = None) -> dict[str, Any]:
     """Execute a tool and return the result."""
+    if env is None:
+        env = {}
+    
     if tool_name == "read_file":
         path = args.get("path", "")
         result = read_file(path)
@@ -181,6 +301,15 @@ def execute_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         else:
             return {"success": False, "error": result.get("error", "Unknown error")}
     
+    elif tool_name == "query_api":
+        method = args.get("method", "GET")
+        path = args.get("path", "")
+        body = args.get("body")
+        api_key = env.get("LMS_API_KEY", "")
+        api_base = env.get("AGENT_API_BASE_URL", "")
+        result = query_api(method, path, body, api_key, api_base)
+        return result
+    
     else:
         return {"success": False, "error": f"Unknown tool: {tool_name}"}
 
@@ -190,6 +319,7 @@ def call_llm_with_tools(
     api_key: str,
     api_base: str,
     model: str,
+    env: dict[str, str],
     max_iterations: int = 10
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """Call the LLM with tool support and return (answer, source, tool_calls).
@@ -199,6 +329,7 @@ def call_llm_with_tools(
         api_key: API key for authentication
         api_base: Base URL of the API
         model: Model name to use
+        env: Environment variables dict
         max_iterations: Maximum tool call iterations
         
     Returns:
@@ -212,7 +343,7 @@ def call_llm_with_tools(
     }
     
     # System prompt
-    system_prompt = """You are a helpful assistant that answers questions by reading project documentation.
+    system_prompt = """You are a helpful assistant that answers questions by reading project documentation and querying the system API.
 
 IMPORTANT: For any question about this project, wiki, or repository:
 1. ALWAYS use list_files first to discover what files exist
@@ -220,11 +351,16 @@ IMPORTANT: For any question about this project, wiki, or repository:
 3. The project documentation may differ from general knowledge - verify by reading files
 4. Include a source reference at the end: "Source: wiki/filename.md#section"
 
+For questions about current data, item counts, scores, or system status:
+1. Use query_api to fetch real-time data from the backend
+2. The API base URL is already configured - just provide the endpoint path
+
 You have access to these tools:
 - read_file: Read a file from the project repository
 - list_files: List files and directories at a given path
+- query_api: Call the backend API to fetch data or check system status
 
-Think step by step. Always verify information by reading actual files."""
+Think step by step. Always verify information by reading actual files or querying the API."""
 
     # Initialize conversation
     messages = [
@@ -286,7 +422,7 @@ Think step by step. Always verify information by reading actual files."""
                 args = {}
             
             # Execute the tool
-            tool_result = execute_tool(tool_name, args)
+            tool_result = execute_tool(tool_name, args, env)
             
             # Log the tool call
             tool_call_log = {
@@ -302,6 +438,8 @@ Think step by step. Always verify information by reading actual files."""
                     result_content = tool_result["content"]
                 elif "entries" in tool_result:
                     result_content = "\n".join(tool_result["entries"])
+                elif "body" in tool_result:
+                    result_content = json.dumps(tool_result["body"])
                 else:
                     result_content = str(tool_result)
             else:
@@ -368,7 +506,7 @@ def main() -> None:
         sys.exit(1)
     
     # Call the LLM with tools
-    answer, source, tool_calls = call_llm_with_tools(question, api_key, api_base, model)
+    answer, source, tool_calls = call_llm_with_tools(question, api_key, api_base, model, env)
     
     # Output JSON result
     result = {
@@ -378,6 +516,7 @@ def main() -> None:
     }
     
     print(json.dumps(result))
+    sys.exit(0)
 
 
 if __name__ == "__main__":
