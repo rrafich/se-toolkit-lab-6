@@ -94,7 +94,7 @@ def read_file(path: str) -> dict[str, Any]:
     try:
         content = file_path.read_text()
         # Truncate if too long (LLM context limit)
-        max_length = 8000
+        max_length = 16000
         if len(content) > max_length:
             content = content[:max_length] + "\n\n... [truncated]"
         return {"success": True, "content": content}
@@ -256,7 +256,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "query_api",
-                "description": "Call the backend API to fetch data or check system status. Use this for questions about current data, item counts, scores, or system information.",
+                "description": "Call the backend API to fetch data or check system status. Use this for questions about current data, item counts, scores, or system information. By default, requests include authentication. Set auth=false to send without API key.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -271,6 +271,10 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                         "body": {
                             "type": "string",
                             "description": "Optional JSON request body for POST/PUT requests"
+                        },
+                        "auth": {
+                            "type": "boolean",
+                            "description": "Whether to include authentication header (default: true). Set to false to test unauthenticated access."
                         }
                     },
                     "required": ["method", "path"]
@@ -305,7 +309,8 @@ def execute_tool(tool_name: str, args: dict[str, Any], env: dict[str, str] = Non
         method = args.get("method", "GET")
         path = args.get("path", "")
         body = args.get("body")
-        api_key = env.get("LMS_API_KEY", "")
+        auth = args.get("auth", True)  # Default to authenticated
+        api_key = env.get("LMS_API_KEY", "") if auth else None
         api_base = env.get("AGENT_API_BASE_URL", "")
         result = query_api(method, path, body, api_key, api_base)
         return result
@@ -342,25 +347,38 @@ def call_llm_with_tools(
         "Authorization": f"Bearer {api_key}",
     }
     
+    # Track files already read to prevent duplicates
+    files_read: set[str] = set()
+    
     # System prompt
-    system_prompt = """You are a helpful assistant that answers questions by reading project documentation and querying the system API.
+    system_prompt = """You answer questions using tools.
 
-IMPORTANT: For any question about this project, wiki, or repository:
-1. ALWAYS use list_files first to discover what files exist
-2. ALWAYS use read_file to find the actual content - do NOT rely on your training data
-3. The project documentation may differ from general knowledge - verify by reading files
-4. Include a source reference at the end: "Source: wiki/filename.md#section"
+RULES:
+1. Never read same file twice
+2. Max 3-4 tool calls, then answer
+3. ALWAYS include "Source: filepath" in answer
 
-For questions about current data, item counts, scores, or system status:
-1. Use query_api to fetch real-time data from the backend
-2. The API base URL is already configured - just provide the endpoint path
+TOOL USAGE:
+- Wiki questions: list_files -> read_file -> answer with source
+- API questions: query_api -> answer with status code
+- Bug questions: query_api -> read_file (model/source) -> compare -> answer with source
 
-You have access to these tools:
-- read_file: Read a file from the project repository
-- list_files: List files and directories at a given path
-- query_api: Call the backend API to fetch data or check system status
+FOR BUG QUESTIONS:
+When asked about bugs/errors:
+1. First query the API to see the error
+2. MUST read the source code files mentioned or related to the endpoint
+3. Look for: field mismatches, None handling, sorting with None values
+4. Common bug: sorted(list, key=lambda x: x.field) fails if field is None
+5. Answer must identify the specific bug AND include source file
 
-Think step by step. Always verify information by reading actual files or querying the API."""
+EXAMPLE for bug question:
+- Q: "What error does /interactions/ return?"
+- Step 1: query_api GET /interactions/
+- Step 2: read_file backend/app/models/interaction.py
+- Step 3: Compare InteractionLog (created_at) vs InteractionModel (timestamp) - MISMATCH!
+- Answer: "Bug: field name mismatch. DB has 'created_at' but response has 'timestamp'. Source: backend/app/models/interaction.py"
+
+AVAILABLE TOOLS: read_file, list_files, query_api(method, path, body?, auth?)"""
 
     # Initialize conversation
     messages = [
@@ -384,7 +402,7 @@ Think step by step. Always verify information by reading actual files or queryin
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
+            with urllib.request.urlopen(req, timeout=120) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             error_body = e.read().decode() if e.fp else ""
@@ -422,7 +440,16 @@ Think step by step. Always verify information by reading actual files or queryin
                 args = {}
             
             # Execute the tool
-            tool_result = execute_tool(tool_name, args, env)
+            # Track files read to prevent duplicates
+            if tool_name == "read_file":
+                path = args.get("path", "")
+                if path in files_read:
+                    tool_result = {"success": False, "error": f"Already read this file: {path}. Do not read same file twice."}
+                else:
+                    files_read.add(path)
+                    tool_result = execute_tool(tool_name, args, env)
+            else:
+                tool_result = execute_tool(tool_name, args, env)
             
             # Log the tool call
             tool_call_log = {
@@ -440,6 +467,10 @@ Think step by step. Always verify information by reading actual files or queryin
                     result_content = "\n".join(tool_result["entries"])
                 elif "body" in tool_result:
                     result_content = json.dumps(tool_result["body"])
+                    # Truncate large API responses to avoid exceeding LLM context limit
+                    max_api_response = 4000
+                    if len(result_content) > max_api_response:
+                        result_content = result_content[:max_api_response] + "\n\n... [response truncated - too many items]"
                 else:
                     result_content = str(tool_result)
             else:
@@ -466,17 +497,23 @@ def extract_source(content: str) -> str:
     """Extract source reference from the LLM's answer."""
     import re
     
-    # First, look for explicit "Source: wiki/..." pattern
-    source_pattern = r'[Ss]ource:\s*(wiki/[\w\-/]+\.md(?:#[\w\-]+)?)'
+    # First, look for explicit "Source: ..." pattern (any file type)
+    source_pattern = r'[Ss]ource:\s*([\w\-/.]+(?:#[\w\-]+)?)'
     match = re.search(source_pattern, content)
     if match:
         return match.group(1)
     
-    # Second, look for any wiki/...md pattern
-    pattern = r'(wiki/[\w\-/]+\.md(?:#[\w\-]+)?)'
-    match = re.search(pattern, content, re.IGNORECASE)
-    if match:
-        return match.group(1)
+    # Second, look for any file path pattern (wiki/*.md, backend/app/*.py, etc.)
+    patterns = [
+        r'(wiki/[\w\-/.]+\.md(?:#[\w\-]+)?)',
+        r'(backend/app/[\w\-/.]+\.py)',
+        r'(docker-compose\.yml)',
+        r'(Dockerfile)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content, re.IGNORECASE)
+        if match:
+            return match.group(1)
     
     # Default: return empty if no source found
     return ""
