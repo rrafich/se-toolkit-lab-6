@@ -9,7 +9,7 @@ import sys
 def test_agent_basic_question():
     """Test that agent returns valid JSON with required fields."""
     # Run the agent
-    result = subprocess.run(
+    result = subprocess.run(https://github.com/rrafich/se-toolkit-lab-6/pull/2/conflict?name=plans%252Ftask-1.md&base_oid=b36dcd89448cc8d0c08f52aef1209b0b3982ecb0&head_oid=049dcd4dccb086e3cdfd0710ef1348895f3d5acf
         [sys.executable, "agent.py", "What is 2+2?"],
         capture_output=True,
         text=True,

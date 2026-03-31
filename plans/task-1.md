@@ -1,24 +1,43 @@
 # Task 1 Plan: Call an LLM from Code
 
-## LLM Configuration
-- Provider: Qwen Code API (self-hosted on VM)
-- Model: qwen3-coder-plus
-- API Base: http://10.93.26.71:8080/v1
-- Auth: Bearer token from .env.agent.secret (LLM_API_KEY)
+## LLM Provider and Model
 
-## Agent Architecture
-1. Parse CLI argument (user question)
-2. Load environment variables (LLM_API_KEY, LLM_API_BASE, LLM_MODEL)
-3. Build OpenAI-compatible API request
-4. Send POST request to LLM
-5. Parse response and extract answer
-6. Output JSON: {"answer": "...", "tool_calls": []}
+- **Provider:** Qwen Code API (self-hosted on VM)
+- **Model:** `qwen3-coder-plus`
+- **API Base:** `http://127.0.0.1:42006/v1`
+- **Authentication:** Bearer token (`my-secret-qwen-key`)
 
-## Error Handling
-- API timeout: 60 second limit
-- Network errors: print to stderr, exit code 1
-- Invalid response: print to stderr, exit code 1
+### Why Qwen Code API?
 
-## Testing
-- Run: uv run agent.py "What is 2+2?"
-- Expect: Valid JSON with answer field
+- Provides 1000 free requests per day
+- No credit card required
+- OpenAI-compatible API endpoint
+- Strong tool calling capabilities
+
+## Agent Structure
+
+The agent (`agent.py`) will:
+
+1. **Parse CLI input** — accept a question as the first command-line argument
+2. **Load configuration** — read `LLM_API_KEY`, `LLM_API_BASE`, `LLM_MODEL` from `.env.agent.secret`
+3. **Call the LLM** — send POST request to `/v1/chat/completions` endpoint
+4. **Format output** — return JSON with `answer` and `tool_calls` fields to stdout
+
+### Output Format
+
+```json
+{"answer": "Representational State Transfer.", "tool_calls": []}
+```
+
+### Error Handling
+
+- All debug/progress output goes to stderr
+- Only valid JSON goes to stdout
+- Exit code 0 on success, non-zero on failure
+- 60-second timeout for API requests
+
+## Implementation Notes
+
+- For Task 1, `tool_calls` will always be an empty array
+- Tools (`read_file`, `list_files`) will be added in Task 2
+- The agentic loop will be implemented in Task 2
