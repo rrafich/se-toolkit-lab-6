@@ -4,7 +4,7 @@ The lab gets updated regularly, so do [sync your fork with the upstream](https:/
 
 <h2>Table of contents</h2>
 
-- [Lab story](#lab-story)
+- [Lab Story](#lab-story)
 - [Learning advice](#learning-advice)
 - [Learning outcomes](#learning-outcomes)
 - [Tasks](#tasks)
